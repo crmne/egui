@@ -525,6 +525,10 @@ pub enum Error {
     #[cfg(feature = "glow")]
     OpenGL(egui_glow::PainterError),
 
+    /// The native OpenGL context was lost. Recreate the window and GL resources.
+    #[cfg(feature = "glow")]
+    OpenGLContextLost,
+
     /// An error from [`wgpu`].
     #[cfg(feature = "wgpu_no_default_features")]
     Wgpu(egui_wgpu::WgpuError),
@@ -552,7 +556,11 @@ impl From<winit::error::EventLoopError> for Error {
 impl From<glutin::error::Error> for Error {
     #[inline]
     fn from(err: glutin::error::Error) -> Self {
-        Self::Glutin(err)
+        if err.error_kind() == glutin::error::ErrorKind::ContextLost {
+            Self::OpenGLContextLost
+        } else {
+            Self::Glutin(err)
+        }
     }
 }
 
@@ -605,6 +613,9 @@ impl std::fmt::Display for Error {
                 write!(f, "egui_glow: {err}")
             }
 
+            #[cfg(feature = "glow")]
+            Self::OpenGLContextLost => write!(f, "the OpenGL context was lost"),
+
             #[cfg(feature = "wgpu_no_default_features")]
             Self::Wgpu(err) => {
                 write!(f, "WGPU error: {err}")
@@ -615,3 +626,7 @@ impl std::fmt::Display for Error {
 
 /// Short for `Result<T, eframe::Error>`.
 pub type Result<T = (), E = Error> = std::result::Result<T, E>;
+
+/// Reset notification for an independently managed native OpenGL context.
+#[cfg(all(feature = "glow", not(target_arch = "wasm32")))]
+pub use native::glow_context_loss::ResetStatus as GraphicsResetStatus;

@@ -77,6 +77,9 @@ struct GlowWinitRunning<'app> {
 
     /// Any not yet applied deltas for this app.
     pending_deltas: TexturesDelta,
+
+    reset_status: super::glow_context_loss::ResetStatus,
+    context_lost: bool,
 }
 
 impl Drop for GlowWinitRunning<'_> {
@@ -239,6 +242,7 @@ impl<'app> GlowWinitApp<'app> {
         Ok((glutin_window_context, painter))
     }
 
+    #[expect(unsafe_code)]
     fn init_run_state(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -269,6 +273,9 @@ impl<'app> GlowWinitApp<'app> {
             &mut self.native_options,
         )?;
         let gl = Arc::clone(painter.gl());
+        let reset_status = unsafe {
+            super::glow_context_loss::ResetStatus::load(&gl, |name| glutin.get_proc_address(name))
+        };
 
         let max_texture_side = painter.max_texture_side();
         glutin.max_texture_side = Some(max_texture_side);
@@ -396,6 +403,8 @@ impl<'app> GlowWinitApp<'app> {
             glutin,
             painter,
             pending_deltas: Default::default(),
+            reset_status,
+            context_lost: false,
         }))
     }
 }
@@ -448,8 +457,13 @@ impl WinitApp for GlowWinitApp<'_> {
                 running.app.as_mut(),
                 Some(&running.glutin.borrow().window(ViewportId::ROOT)),
             );
-            running.app.on_exit(Some(running.painter.borrow().gl()));
-            running.painter.borrow_mut().destroy();
+            if running.context_lost {
+                running.app.on_exit(None);
+                running.painter.borrow_mut().abandon();
+            } else {
+                running.app.on_exit(Some(running.painter.borrow().gl()));
+                running.painter.borrow_mut().destroy();
+            }
         }
     }
 
@@ -459,7 +473,9 @@ impl WinitApp for GlowWinitApp<'_> {
         window_id: WindowId,
     ) -> Result<EventResult> {
         if let Some(running) = &mut self.running {
-            running.run_ui_and_paint(event_loop, window_id, false)
+            let result = running.run_ui_and_paint(event_loop, window_id, false);
+            running.note_context_loss(&result);
+            result
         } else {
             Ok(EventResult::Wait)
         }
@@ -471,7 +487,9 @@ impl WinitApp for GlowWinitApp<'_> {
         window_id: WindowId,
     ) -> Result<EventResult> {
         if let Some(running) = &mut self.running {
-            running.run_ui_and_paint(event_loop, window_id, true)
+            let result = running.run_ui_and_paint(event_loop, window_id, true);
+            running.note_context_loss(&result);
+            result
         } else {
             Ok(EventResult::Wait)
         }
@@ -574,7 +592,15 @@ impl WinitApp for GlowWinitApp<'_> {
 }
 
 impl GlowWinitRunning<'_> {
+    fn note_context_loss(&mut self, result: &Result<EventResult>) {
+        if matches!(result, Err(crate::Error::OpenGLContextLost)) && !self.context_lost {
+            self.context_lost = true;
+            self.app.on_gl_context_lost();
+        }
+    }
+
     /// With `logic_only`, only [`crate::App::logic`] runs, as for a hidden window.
+    #[expect(unsafe_code)]
     fn run_ui_and_paint(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -582,6 +608,13 @@ impl GlowWinitRunning<'_> {
         logic_only: bool,
     ) -> Result<EventResult> {
         profiling::function_scope!();
+
+        // The shared context stays current between frames, including logic-only
+        // ticks of a hidden window. Check before clearing, uploading or drawing.
+        if self.glutin.borrow().current_gl_context.is_none() {
+            return Err(crate::Error::OpenGLContextLost);
+        }
+        unsafe { self.reset_status.check()? };
 
         let Some(viewport_id) = self
             .glutin
@@ -733,7 +766,7 @@ impl GlowWinitRunning<'_> {
 
             {
                 frame_timer.pause();
-                change_gl_context(current_gl_context, not_current_gl_context, gl_surface);
+                change_gl_context(current_gl_context, not_current_gl_context, gl_surface)?;
                 frame_timer.resume();
             }
 
@@ -799,7 +832,7 @@ impl GlowWinitRunning<'_> {
             {
                 // We may need to switch contexts again, because of immediate viewports:
                 frame_timer.pause();
-                change_gl_context(current_gl_context, not_current_gl_context, gl_surface);
+                change_gl_context(current_gl_context, not_current_gl_context, gl_surface)?;
                 frame_timer.resume();
             }
 
@@ -866,6 +899,7 @@ impl GlowWinitRunning<'_> {
                 // On Wayland this makes winit wait for the compositor's frame callback before
                 // the next `RedrawRequested`, so we don't block in a vsync swap while hidden:
                 window.pre_present_notify();
+                unsafe { self.reset_status.check()? };
                 gl_surface.swap_buffers(context)?;
                 frame_timer.resume();
             }
@@ -1026,7 +1060,7 @@ fn change_gl_context(
     current_gl_context: &mut Option<glutin::context::PossiblyCurrentContext>,
     not_current_gl_context: &mut Option<glutin::context::NotCurrentContext>,
     gl_surface: &glutin::surface::Surface<glutin::surface::WindowSurface>,
-) {
+) -> Result<()> {
     profiling::function_scope!();
 
     if !cfg!(target_os = "windows") {
@@ -1038,7 +1072,7 @@ fn change_gl_context(
         if let Some(current_gl_context) = current_gl_context {
             profiling::scope!("is_current");
             if gl_surface.is_current(current_gl_context) {
-                return; // Early-out to save a lot of time.
+                return Ok(()); // Early-out to save a lot of time.
             }
         }
     }
@@ -1049,13 +1083,22 @@ fn change_gl_context(
         profiling::scope!("make_not_current");
         current_gl_context
             .take()
-            .unwrap()
+            .ok_or(crate::Error::OpenGLContextLost)?
             .make_not_current()
-            .unwrap()
+            .map_err(|error| {
+                log::error!("Could not release the OpenGL context: {error}");
+                crate::Error::OpenGLContextLost
+            })?
     };
 
     profiling::scope!("make_current");
-    *current_gl_context = Some(not_current.make_current(gl_surface).unwrap());
+    // WGL may report an ordinary OS error if a reset races the status query.
+    // Either way this context is unusable and its resources must be rebuilt.
+    *current_gl_context = Some(not_current.make_current(gl_surface).map_err(|error| {
+        log::error!("Could not make the OpenGL context current: {error}");
+        crate::Error::OpenGLContextLost
+    })?);
+    Ok(())
 }
 
 impl GlutinWindowContext {
@@ -1165,11 +1208,15 @@ impl GlutinWindowContext {
         });
         log::debug!("creating gl context using raw window handle: {glutin_raw_window_handle:?}");
 
-        let [default_attributes, fallback_attributes @ ..] =
-            context_attributes_to_try(glutin_raw_window_handle);
+        let reset_notification = cfg!(target_os = "windows")
+            && gl_display
+                .supported_features()
+                .contains(glutin::display::DisplayFeatures::CONTEXT_ROBUSTNESS);
+        let mut attributes =
+            context_attributes_to_try(glutin_raw_window_handle, reset_notification).into_iter();
         let gl_context = create_first_context(
-            default_attributes,
-            fallback_attributes,
+            attributes.next().unwrap(),
+            attributes,
             |context_attributes| unsafe {
                 profiling::scope!("create_context");
                 gl_config
@@ -1406,11 +1453,14 @@ impl GlutinWindowContext {
         if let Some(viewport) = self.viewports.get(&viewport_id)
             && let Some(gl_surface) = &viewport.gl_surface
         {
-            change_gl_context(
+            if let Err(error) = change_gl_context(
                 &mut self.current_gl_context,
                 &mut self.not_current_gl_context,
                 gl_surface,
-            );
+            ) {
+                log::warn!("Could not make the context current for resize: {error}");
+                return;
+            }
             gl_surface.resize(
                 self.current_gl_context
                     .as_ref()
@@ -1686,7 +1736,10 @@ fn render_immediate_viewport(
 
     let screen_size_in_pixels: [u32; 2] = window.inner_size().into();
 
-    change_gl_context(current_gl_context, not_current_gl_context, gl_surface);
+    if let Err(error) = change_gl_context(current_gl_context, not_current_gl_context, gl_surface) {
+        log::warn!("Could not make the immediate viewport context current: {error}");
+        return;
+    }
 
     let current_gl_context = current_gl_context.as_ref().unwrap();
 
@@ -1735,18 +1788,31 @@ fn render_immediate_viewport(
 ///    through WGL either.
 fn context_attributes_to_try(
     raw_window_handle: Option<raw_window_handle::RawWindowHandle>,
-) -> [glutin::context::ContextAttributes; 3] {
-    use glutin::context::{ContextApi, ContextAttributesBuilder, GlProfile};
+    reset_notification: bool,
+) -> Vec<glutin::context::ContextAttributes> {
+    use glutin::context::{ContextApi, ContextAttributesBuilder, GlProfile, Robustness};
 
-    [
-        ContextAttributesBuilder::new().build(raw_window_handle),
-        ContextAttributesBuilder::new()
-            .with_context_api(ContextApi::Gles(None))
-            .build(raw_window_handle),
-        ContextAttributesBuilder::new()
-            .with_profile(GlProfile::Compatibility)
-            .build(raw_window_handle),
-    ]
+    let attributes = |robustness| {
+        [
+            ContextAttributesBuilder::new()
+                .with_robustness(robustness)
+                .build(raw_window_handle),
+            ContextAttributesBuilder::new()
+                .with_robustness(robustness)
+                .with_context_api(ContextApi::Gles(None))
+                .build(raw_window_handle),
+            ContextAttributesBuilder::new()
+                .with_robustness(robustness)
+                .with_profile(GlProfile::Compatibility)
+                .build(raw_window_handle),
+        ]
+    };
+    let mut attempts = Vec::new();
+    if reset_notification {
+        attempts.extend(attributes(Robustness::RobustLoseContextOnReset));
+    }
+    attempts.extend(attributes(Robustness::NotRobust));
+    attempts
 }
 
 /// Call `create` with `first`, then with each of `fallbacks` until one succeeds.
@@ -1806,7 +1872,10 @@ mod tests {
 
     #[test]
     fn context_attributes_end_with_compatibility_profile() {
-        let attempts = context_attributes_to_try(None).map(|attributes| format!("{attributes:?}"));
+        let attempts: Vec<_> = context_attributes_to_try(None, false)
+            .into_iter()
+            .map(|attributes| format!("{attributes:?}"))
+            .collect();
         assert!(attempts[0].contains("profile: None") && attempts[0].contains("api: None"));
         assert!(attempts[1].contains("api: Some(Gles(None))"));
         assert!(
@@ -1814,6 +1883,22 @@ mod tests {
                 && attempts[2].contains("api: None"),
             "the last resort asks for a compatibility profile of any version: {}",
             attempts[2]
+        );
+    }
+
+    #[test]
+    fn reset_notification_preserves_non_robust_driver_fallbacks() {
+        let attempts = context_attributes_to_try(None, true);
+        assert_eq!(attempts.len(), 6);
+        assert!(
+            attempts[..3]
+                .iter()
+                .all(|a| format!("{a:?}").contains("RobustLoseContextOnReset"))
+        );
+        assert!(
+            attempts[3..]
+                .iter()
+                .all(|a| format!("{a:?}").contains("NotRobust"))
         );
     }
 

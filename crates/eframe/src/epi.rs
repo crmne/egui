@@ -221,6 +221,15 @@ pub trait App {
     #[cfg(feature = "glow")]
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {}
 
+    /// Called when the native OpenGL context is lost, before shutdown.
+    ///
+    /// Stop using GL resources. `on_exit` will receive `None`, and
+    /// `run_native` will return [`crate::Error::OpenGLContextLost`]. An app
+    /// that keeps its state outside the window can recreate it with a fresh
+    /// context by calling `run_native` again.
+    #[cfg(feature = "glow")]
+    fn on_gl_context_lost(&mut self) {}
+
     /// Called once on shutdown, after [`Self::save`].
     ///
     /// If you need to abort an exit use [`Self::on_close_event`].

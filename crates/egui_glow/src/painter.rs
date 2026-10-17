@@ -725,6 +725,11 @@ impl Painter {
         }
     }
 
+    /// Forget GL objects after context loss without issuing GL calls.
+    pub fn abandon(&mut self) {
+        self.destroyed = true;
+    }
+
     fn assert_not_destroyed(&self) {
         assert!(!self.destroyed, "the egui glow has already been destroyed!");
     }
