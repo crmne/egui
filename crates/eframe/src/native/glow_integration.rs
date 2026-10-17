@@ -1085,11 +1085,19 @@ fn change_gl_context(
             .take()
             .ok_or(crate::Error::OpenGLContextLost)?
             .make_not_current()
-            .map_err(crate::Error::from)?
+            .map_err(|error| {
+                log::error!("Could not release the OpenGL context: {error}");
+                crate::Error::OpenGLContextLost
+            })?
     };
 
     profiling::scope!("make_current");
-    *current_gl_context = Some(not_current.make_current(gl_surface)?);
+    // WGL may report an ordinary OS error if a reset races the status query.
+    // Either way this context is unusable and its resources must be rebuilt.
+    *current_gl_context = Some(not_current.make_current(gl_surface).map_err(|error| {
+        log::error!("Could not make the OpenGL context current: {error}");
+        crate::Error::OpenGLContextLost
+    })?);
     Ok(())
 }
 
