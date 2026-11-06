@@ -275,7 +275,15 @@ impl RenderState {
                 |s| s.get_capabilities(&adapter).formats,
             )
         };
-        let target_format = crate::preferred_framebuffer_format(&surface_formats)?;
+        let target_format = match config
+            .surface_format_selector
+            .as_ref()
+            .and_then(|select| select(&surface_formats))
+            .filter(|format| surface_formats.contains(format))
+        {
+            Some(format) => format,
+            None => crate::preferred_framebuffer_format(&surface_formats)?,
+        };
 
         let renderer = Renderer::new(&device, target_format, options);
 
@@ -350,6 +358,16 @@ pub struct WgpuConfiguration {
     /// in that case either.
     pub on_surface_status:
         Arc<dyn Fn(&wgpu::CurrentSurfaceTexture) -> SurfaceErrorAction + Send + Sync>,
+
+    /// Picks the surface's texture format from those the surface supports.
+    ///
+    /// `None` (the default), or a selector returning `None`, uses
+    /// [`preferred_framebuffer_format`]. A selector may choose a float format such as
+    /// [`wgpu::TextureFormat::Rgba16Float`] to present values above 1, for example
+    /// HDR images on an extended-range display; egui itself keeps writing
+    /// gamma-encoded colors to a non-sRGB format.
+    pub surface_format_selector:
+        Option<Arc<dyn Fn(&[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> + Send + Sync>>,
 }
 
 #[test]
@@ -364,10 +382,12 @@ impl core::fmt::Debug for WgpuConfiguration {
             surface,
             wgpu_setup,
             on_surface_status: _,
+            surface_format_selector,
         } = self;
         f.debug_struct("WgpuConfiguration")
             .field("surface", &surface)
             .field("wgpu_setup", &wgpu_setup)
+            .field("surface_format_selector", &surface_format_selector.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -411,6 +431,7 @@ impl Default for WgpuConfiguration {
                     SurfaceErrorAction::SkipFrame
                 }
             }),
+            surface_format_selector: None,
         }
     }
 }
