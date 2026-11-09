@@ -108,6 +108,28 @@ pub trait CallbackTrait: Send + Sync {
         Vec::new()
     }
 
+    /// Whether this callback reads what egui has drawn under it, as a blur
+    /// behind glass does. Each such callback ends the render pass before
+    /// it, has [`CallbackTrait::backdrop`] called, and starts a new pass
+    /// that keeps what was drawn.
+    fn reads_backdrop(&self) -> bool {
+        false
+    }
+
+    /// Called between render passes, before [`CallbackTrait::paint`], for a
+    /// callback that [reads the backdrop](CallbackTrait::reads_backdrop).
+    /// `target` holds everything egui drew before this callback; it can be
+    /// copied from, and encoded passes run before the paint.
+    fn backdrop(
+        &self,
+        _info: &PaintCallbackInfo,
+        _device: &wgpu::Device,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        _target: &wgpu::Texture,
+        _callback_resources: &CallbackResources,
+    ) {
+    }
+
     /// Called after all [`CallbackTrait::finish_prepare`] calls are done.
     ///
     /// It is given access to the [`wgpu::RenderPass`] so that it can issue draw commands
@@ -482,6 +504,70 @@ impl Renderer {
         paint_jobs: &[epaint::ClippedPrimitive],
         screen_descriptor: &ScreenDescriptor,
     ) {
+        self.render_range(
+            render_pass,
+            paint_jobs,
+            0..paint_jobs.len(),
+            screen_descriptor,
+        );
+    }
+
+    /// The paint jobs at which a callback [reads the
+    /// backdrop](CallbackTrait::reads_backdrop), where a render pass ends.
+    pub fn backdrop_breaks(paint_jobs: &[epaint::ClippedPrimitive]) -> Vec<usize> {
+        paint_jobs
+            .iter()
+            .enumerate()
+            .filter_map(|(at, job)| match &job.primitive {
+                Primitive::Callback(callback) => callback
+                    .callback
+                    .downcast_ref::<Callback>()
+                    .filter(|cbfn| cbfn.0.reads_backdrop())
+                    .map(|_| at),
+                Primitive::Mesh(_) => None,
+            })
+            .collect()
+    }
+
+    /// Runs [`CallbackTrait::backdrop`] for the callback at `paint_jobs[at]`.
+    pub fn backdrop(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+        paint_jobs: &[epaint::ClippedPrimitive],
+        at: usize,
+        screen_descriptor: &ScreenDescriptor,
+    ) {
+        let epaint::ClippedPrimitive {
+            clip_rect,
+            primitive: Primitive::Callback(callback),
+        } = &paint_jobs[at]
+        else {
+            return;
+        };
+        let Some(cbfn) = callback.callback.downcast_ref::<Callback>() else {
+            return;
+        };
+        let info = PaintCallbackInfo {
+            viewport: callback.rect,
+            clip_rect: *clip_rect,
+            pixels_per_point: screen_descriptor.pixels_per_point,
+            screen_size_px: screen_descriptor.size_in_pixels,
+        };
+        cbfn.0
+            .backdrop(&info, device, encoder, target, &self.callback_resources);
+    }
+
+    /// Like [`Self::render`], drawing only the paint jobs in `range`, so a
+    /// frame can be drawn over several render passes.
+    pub fn render_range(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        paint_jobs: &[epaint::ClippedPrimitive],
+        range: std::ops::Range<usize>,
+        screen_descriptor: &ScreenDescriptor,
+    ) {
         profiling::function_scope!();
 
         let pixels_per_point = screen_descriptor.pixels_per_point;
@@ -494,11 +580,22 @@ impl Renderer {
         let mut index_buffer_slices = self.index_buffer.slices.iter();
         let mut vertex_buffer_slices = self.vertex_buffer.slices.iter();
 
-        for epaint::ClippedPrimitive {
-            clip_rect,
-            primitive,
-        } in paint_jobs
+        for (
+            at,
+            epaint::ClippedPrimitive {
+                clip_rect,
+                primitive,
+            },
+        ) in paint_jobs.iter().enumerate()
         {
+            if !range.contains(&at) {
+                // Jobs drawn in another pass still take their buffer slices.
+                if let Primitive::Mesh(_) = primitive {
+                    index_buffer_slices.next();
+                    vertex_buffer_slices.next();
+                }
+                continue;
+            }
             if needs_reset {
                 render_pass.set_viewport(
                     0.0,
