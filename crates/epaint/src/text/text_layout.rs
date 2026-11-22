@@ -471,9 +471,8 @@ fn cluster_boundaries(glyph_buffer: &harfrust::GlyphBuffer, text_len: usize) -> 
 /// Logical bytes covered by the cluster that starts at `cluster`.
 fn cluster_char_range(bounds: &[usize], cluster: usize) -> Range<usize> {
     let end = bounds
-        .iter()
+        .get(bounds.partition_point(|&boundary| boundary <= cluster))
         .copied()
-        .find(|&boundary| boundary > cluster)
         .unwrap_or(cluster);
     cluster..end
 }
