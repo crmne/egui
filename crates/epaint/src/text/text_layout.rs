@@ -1786,6 +1786,16 @@ mod tests {
         assert_eq!(cluster_char_range(&bounds, 6), 6..8);
     }
 
+    #[test]
+    fn a_cluster_ends_at_the_next_boundary_or_at_itself() {
+        let bounds = [0usize, 1, 3, 4, 7];
+        assert_eq!(cluster_char_range(&bounds, 1), 1..3);
+        assert_eq!(cluster_char_range(&bounds, 2), 2..3);
+        assert_eq!(cluster_char_range(&bounds, 4), 4..7);
+        assert_eq!(cluster_char_range(&bounds, 7), 7..7);
+        assert_eq!(cluster_char_range(&bounds, 9), 9..9);
+    }
+
     /// A shaped glyph `width` wide at `x`, drawing the character at byte `cluster`.
     fn shaped(cluster: u32, x: f32, width: f32) -> Glyph {
         let ink = UvRect {
