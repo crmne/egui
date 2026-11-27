@@ -186,4 +186,8 @@ pub enum Event {
 
         image: std::sync::Arc<ColorImage>,
     },
+
+    /// The reply to [`crate::ViewportCommand::RequestActivationToken`], or
+    /// `None` if no token can be had.
+    ActivationToken(Option<String>),
 }
