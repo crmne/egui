@@ -843,6 +843,9 @@ impl GlowWinitRunning<'_> {
                         ActionRequested::Copy => {
                             egui_winit.egui_input_mut().events.push(egui::Event::Copy);
                         }
+                        ActionRequested::ActivationToken => {
+                            egui_winit.request_activation_token(&window);
+                        }
                         ActionRequested::Paste => {
                             if let Some(contents) = egui_winit.clipboard_text() {
                                 let contents = contents.replace("\r\n", "\n");

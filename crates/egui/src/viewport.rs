@@ -1217,6 +1217,13 @@ pub enum ViewportCommand {
     ///
     /// This is equivalent to the system keyboard shortcut for paste (e.g. CTRL + V).
     RequestPaste,
+
+    /// Request an activation token, to hand to a program this window is about
+    /// to start or open so the windowing system lets it take focus.
+    ///
+    /// The reply is [`crate::Event::ActivationToken`]. Only Wayland and X11
+    /// have such tokens; elsewhere the reply carries `None`.
+    RequestActivationToken,
 }
 
 impl ViewportCommand {

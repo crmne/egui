@@ -289,6 +289,27 @@ impl State {
         self.egui_input.take()
     }
 
+    /// Asks the windowing system for an activation token. The reply reaches
+    /// egui as [`egui::Event::ActivationToken`], at once with `None` where no
+    /// token can be had.
+    pub fn request_activation_token(&mut self, window: &Window) {
+        #[cfg(all(
+            any(feature = "wayland", feature = "x11"),
+            unix,
+            not(any(target_vendor = "apple", target_os = "android"))
+        ))]
+        {
+            use winit::platform::startup_notify::WindowExtStartupNotify as _;
+            if window.request_activation_token().is_ok() {
+                return;
+            }
+        }
+        let _ = window;
+        self.egui_input
+            .events
+            .push(egui::Event::ActivationToken(None));
+    }
+
     /// Call this when there is a new event.
     ///
     /// The result can be found in [`Self::egui_input`] and be extracted with [`Self::take_egui_input`].
@@ -522,13 +543,23 @@ impl State {
                 consumed: false,
             },
 
+            WindowEvent::ActivationTokenDone { token, .. } => {
+                self.egui_input
+                    .events
+                    .push(egui::Event::ActivationToken(Some(token.clone().into_raw())));
+                EventResponse {
+                    repaint: true,
+                    consumed: false,
+                }
+            }
+
             // Things we completely ignore:
-            WindowEvent::ActivationTokenDone { .. }
-            | WindowEvent::AxisMotion { .. }
-            | WindowEvent::DoubleTapGesture { .. } => EventResponse {
-                repaint: false,
-                consumed: false,
-            },
+            WindowEvent::AxisMotion { .. } | WindowEvent::DoubleTapGesture { .. } => {
+                EventResponse {
+                    repaint: false,
+                    consumed: false,
+                }
+            }
 
             WindowEvent::PinchGesture { delta, .. } => {
                 // Positive delta values indicate magnification (zooming in).
@@ -1718,6 +1749,8 @@ fn translate_cursor(cursor_icon: egui::CursorIcon) -> Option<winit::window::Curs
 // ---------------------------------------------------------------------------
 #[derive(PartialEq, Eq, Hash, Debug)]
 pub enum ActionRequested {
+    /// See [`ViewportCommand::RequestActivationToken`].
+    ActivationToken,
     Screenshot(egui::UserData),
     Cut,
     Copy,
@@ -1974,6 +2007,9 @@ fn process_viewport_command(
         }
         ViewportCommand::RequestPaste => {
             actions_requested.push(ActionRequested::Paste);
+        }
+        ViewportCommand::RequestActivationToken => {
+            actions_requested.push(ActionRequested::ActivationToken);
         }
     }
 }
